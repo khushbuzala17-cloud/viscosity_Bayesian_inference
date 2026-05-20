@@ -1,0 +1,339 @@
+# ============================================================
+# Imports
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import corner
+
+
+from scipy.interpolate import interp1d
+
+import InferenceWorkflow.BayesianSampler as sampler
+import InferenceWorkflow.Likelihood as likelihood
+import InferenceWorkflow.prior as prior
+
+from EOSgenerators.SpeedofSound_EOS import compute_EOS
+from TOVsolver.unit import g_cm_3, dyn_cm_2
+import EOSgenerators.crust_EOS as crust
+
+
+# ============================================================
+# SIMPLE TOV SOLVER
+# ============================================================
+
+def solve_TOV_simple(eps, pres):
+
+    inveos = interp1d(pres, eps, kind="linear", fill_value="extrapolate")
+
+    def tov_rhs(r, y):
+        P, m = y
+
+        if P <= 0:
+            return np.array([0, 0])
+
+        e = inveos(P)
+
+        dPdr = -(e + P) * (m + 4*np.pi*r**3*P) / (r * (r - 2*m))
+        dmdr = 4*np.pi*r**2*e
+
+        return np.array([dPdr, dmdr])
+
+    P_c_list = np.geomspace(pres[-1]*0.5, pres[-1]*5, 25)
+
+    M_list = []
+    R_list = []
+
+    for Pc in P_c_list:
+
+        r = 1e-5
+        dr = 20.0
+
+        P = Pc
+        m = 4/3*np.pi*r**3*inveos(P)
+
+        while P > pres[0] and r < 3e6:
+
+            k1 = tov_rhs(r, [P, m])
+            k2 = tov_rhs(r+dr/2, [P+dr*k1[0]/2, m+dr*k1[1]/2])
+            k3 = tov_rhs(r+dr/2, [P+dr*k2[0]/2, m+dr*k2[1]/2])
+            k4 = tov_rhs(r+dr, [P+dr*k3[0], m+dr*k3[1]])
+
+            P += dr*(k1[0]+2*k2[0]+2*k3[0]+k4[0])/6
+            m += dr*(k1[1]+2*k2[1]+2*k3[1]+k4[1])/6
+            r += dr
+
+            if P < 0:
+                break
+
+        M_list.append(m)
+        R_list.append(r)
+
+    M_arr = np.array(M_list) / 1.989e33   # Msun
+    R_arr = np.array(R_list) / 1e5        # km
+
+    return M_arr, R_arr
+
+
+# ============================================================
+# Parameters
+# ============================================================
+
+parameters = [
+    "a1","a2","a3","a4","a5","d1",
+    "S_tilde","J_tilde","V_tilde","W_tilde"
+]
+
+
+# ============================================================
+# Prior
+# ============================================================
+
+def prior_transform(cube):
+
+    a1 = prior.flat_prior(0.1, 1.5, cube[0])
+    a2 = prior.flat_prior(1.5, 12.0, cube[1])
+    a3 = prior.flat_prior(0.05*a2, 2.0*a2, cube[2])
+    a4 = prior.flat_prior(1.5, 37.0, cube[3])
+    a5 = prior.flat_prior(0.1, 1.0, cube[4])
+    d1 = prior.flat_prior(14.7, 15.9, cube[5])
+
+    S = prior.flat_prior(2.19e-6, 5.24e-6, cube[6])
+    J = prior.flat_prior(1.93e-2, 2.00e-2, cube[7])
+    V = prior.flat_prior(1.38e-10, 1.07e-3, cube[8])
+    W = prior.flat_prior(1.32e-6, 1.03e-2, cube[9])
+
+    return (a1,a2,a3,a4,a5,d1,S,J,V,W)
+
+
+# ============================================================
+# Crust EOS
+# ============================================================
+
+data = np.loadtxt(
+    "Test_Case/DDME2 (neutrino).txt",
+    delimiter=",",
+    skiprows=1
+)
+
+eps_crust = data[:,4] * g_cm_3
+pres_crust = data[:,5] * dyn_cm_2
+
+eps_com, pres_com = crust.PolyInterpolate(eps_crust, pres_crust)
+
+eps_com, idx = np.unique(eps_com, return_index=True)
+pres_com = pres_com[idx]
+
+x_last = eps_com[-1]
+y_last = pres_com[-1]
+dydx_last = (pres_com[-1]-pres_com[-2])/(eps_com[-1]-eps_com[-2])
+
+
+# ============================================================
+# Core EOS
+# ============================================================
+
+CS_EOS = compute_EOS(x_last, y_last, dydx_last)
+
+core_e = np.geomspace(x_last, 2e16*g_cm_3, 200)
+
+
+# ============================================================
+# r-mode constants
+# ============================================================
+
+K_to_MeV = 8.617e-11
+Lambda_QCD = 1e3
+
+sigma = 5/3
+delta = 6
+
+
+# ============================================================
+# YOUR omega equations
+# ============================================================
+
+def omega_shear(T, M, R, J, S):
+    T = T * K_to_MeV
+    return (1.0267e8)*(
+        (S*Lambda_QCD**sigma)/(J**2*M**2*R**3*T**sigma)
+    )**(1/6)
+
+
+def omega_bulk(T, M, R, J, V):
+    T = T * K_to_MeV
+    return (9.9794e10)*(
+        (T**delta*V*Lambda_QCD**(-delta)*R)/(J**2*M**2)
+    )**(1/4)
+
+
+def omega_mutual(T, M, R, J, W):
+    T = T * K_to_MeV
+    return (6.639e26)*(
+        (W*Lambda_QCD**delta*R)/(J**2*M**2*T**delta)
+    )**(1/2)
+
+
+
+# ============================================================
+# Observations
+# ============================================================
+
+T_obs_arr = np.array([0.185e8,1.044e8,0.028e8,0.025e8,0.3e6,0.39e6])
+f_obs_arr = np.array([131.2,641.9,622.1,160.8,173.7,205.5])
+f_sigma = 0.05*f_obs_arr
+T_sigma = 0.05*T_obs_arr
+
+# ============================================================
+# Likelihood
+# ============================================================
+
+def likelihood_transform(paras):
+
+    a1,a2,a3,a4,a5,d1,S,J,V,W = paras
+
+    a6 = CS_EOS.cal_a6(a1,a2,a3,a4,a5)
+    a = (a1,a2,a3,a4,a5,a6)
+
+    if not CS_EOS.check_a(a):
+        return -1e100
+
+    core_p = CS_EOS.cal_core_p(core_e,a)
+
+    full_e = np.concatenate((eps_com, core_e[1:]))
+    full_p = np.concatenate((pres_com, core_p[1:]))
+
+    # =========================
+    # TOV
+    # =========================
+
+    M_arr, R_arr = solve_TOV_simple(full_e, full_p)
+
+    if len(M_arr) < 5:
+        return -1e100
+
+    
+    mu_m = np.mean(M_arr)
+    mu_R = np.mean(R_arr)
+    sort_idx = np.argsort(M_arr)
+    M_arr = M_arr[sort_idx]
+    R_arr = R_arr[sort_idx]
+
+    target_M = 1.5
+    target_R = 10.74
+
+    if target_M < M_arr.min() or target_M > M_arr.max():
+        return -1e100
+
+    R_star = np.interp(target_M, M_arr, R_arr)
+    M_star = target_M
+
+    M = M_star * 1.989e33
+    R = R_star * 1e5
+
+    logL = 0.0
+
+    # =========================
+    # MR likelihood
+    # =========================
+
+    logL += -0.5 * (
+        (M_star - mu_m)**2 / 0.07**2 +
+        (R_star - mu_R)**2 / 0.65**2
+    )
+
+    # =========================
+    # r-mode likelihood
+    # =========================
+
+    for T_obs, f_obs, f_sig, T_sig in zip(T_obs_arr, f_obs_arr, f_sigma, T_sigma):
+
+        omega_s = omega_shear(T_obs, M, R, J, S)
+        omega_b1 = omega_bulk(T_obs, M, R, J, V)
+        omega_b2 = omega_mutual(T_obs, M, R, J, W)
+
+        omega_model = min(omega_s, omega_b1, omega_b2)
+        mu_f = np.mean(f_obs_arr)
+        mu_T = np.mean(T_obs_arr)
+
+        f_model = omega_model / (2.0 * np.pi)
+        T_model = 2.83e5
+
+        logL += -0.5 * (
+        (f_model - mu_f)**2 / f_sig**2 +
+        (T_model - mu_T)**2 / T_sig**2
+    )
+    return logL
+
+# ============================================================
+# Run sampler
+# ============================================================
+
+
+samples = sampler.UltranestSampler(
+    parameters,
+    likelihood_transform,
+    prior_transform,
+    2*len(parameters),
+    1000,
+    200000
+)
+
+
+
+# ============================================================
+# Results
+# ============================================================
+
+print("Posterior samples:", samples.shape[0])
+
+print("\nMean:\n", np.mean(samples, axis=0))
+print("\nStd:\n", np.std(samples, axis=0))
+
+
+# ============================================================
+# Corner plot
+# ============================================================
+
+posterior = samples[:, [6,8,9,7]]
+
+labels = [
+    r"$\tilde{S}$",
+    r"$\tilde{V}$",
+    r"$\tilde{W}$",
+    r"$\tilde{J}$"
+]
+
+ranges = [
+    (1.8e-6, 5.9e-6),
+    (-0.0005, 0.0016),
+    (-0.0018, 0.0121),
+    (0.019, 0.0205)
+]
+
+fig = corner.corner(
+    posterior,
+    labels=labels,
+    range=ranges,
+    quantiles=[0.16,0.5,0.84],
+    show_titles=False,
+    title_fmt=".3e",
+    bins=35,
+    smooth=2.0,
+    smooth1d=2.0,
+    color="#0EAD40FF",
+    fill_contours=True
+)
+fig.suptitle("M = 1.5$M_\odot$", fontsize=16)
+for ax in fig.axes:
+    # Borders
+    for spine in ax.spines.values():
+        spine.set_edgecolor("black")
+        spine.set_linewidth(1.2)
+
+    # Ticks
+    ax.tick_params(axis='both', which='both',
+                   colors='black', labelsize=10,
+                   width=1.2, length=4)
+plt.tight_layout()
+plt.show()
